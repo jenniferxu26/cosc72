@@ -11,7 +11,7 @@ from peft import PeftModel
 # parameters
 DEF_CKPT  = pathlib.Path("checkpoints/mistral_lora/final_adapter")
 DEF_TEST  = pathlib.Path("data/proc/test.jsonl")
-DEF_OUT   = pathlib.Path("infer/test_pred.jsonl")
+DEF_OUT   = pathlib.Path("infer/test_pred_lora.jsonl")
 TEMP_DEF  = 0.8
 TOPP_DEF  = 0.9
 BATCH_DEF = 4
@@ -76,3 +76,5 @@ for rec in tqdm(test_ds, desc="translate"):
     if len(batch_prompts) >= args.batch: flush()
 flush()
 out_f.close()
+
+print(f"Translations written to: {args.out.resolve()}")
