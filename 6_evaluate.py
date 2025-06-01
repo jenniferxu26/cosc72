@@ -10,8 +10,8 @@ nltk.download("punkt", quiet=True); nltk.download("wordnet", quiet=True)
 
 # CLI
 DEF_REFS = pathlib.Path("data/proc/test.jsonl")
-DEF_BASE = pathlib.Path("infer/baseline_pred.jsonl")
-DEF_LORA = pathlib.Path("infer/stacked_pred.jsonl")
+DEF_BASE = pathlib.Path("infer/baseline_pred_clean.jsonl")
+DEF_LORA = pathlib.Path("infer/stacked_pred_clean.jsonl")
 
 ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 ap.add_argument("--refs",  type=pathlib.Path, default=DEF_REFS)

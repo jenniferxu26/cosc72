@@ -33,15 +33,26 @@ VAL_FRAC = 0.05
 SEED     = 42
 
 # helper functions
-def build_example(rec, tok):
-    # convert raw zh‑en record into input/label IDs.
-    prompt_ids = tok(
-        f"<cn>{rec['zh']}</cn>\n<gloss>{rec['gloss']}</gloss>\n<trans>",
-        add_special_tokens=False,
-    )["input_ids"]
+def build_example(rec, tok, ctx_lookup=None):
+    # pull the extra explanation, if available
+    context = ""
+    if ctx_lookup is not None:
+        context = ctx_lookup.get(rec["zh"], "").strip()
+
+    # build the prompt template
+    prompt = (
+            f"<cn>{rec['zh']}</cn>\n"
+            f"<gloss>{rec['gloss']}</gloss>\n"
+            + (f"<context>{context}</context>\n" if context else "")
+            + "<trans>"
+    )
+
+    # tokenize prompt + answer exactly as before
+    prompt_ids = tok(prompt, add_special_tokens=False)["input_ids"]
     answer_ids = tok(rec["en"] + tok.eos_token, add_special_tokens=False)["input_ids"]
+
     rec["input_ids"] = prompt_ids + answer_ids
-    rec["labels"]     = [-100] * len(prompt_ids) + answer_ids
+    rec["labels"] = [-100] * len(prompt_ids) + answer_ids
     return rec
 
 def main():
@@ -66,7 +77,14 @@ def main():
     tok = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
     tok.pad_token = tok.eos_token
 
-    ds_proc = ds_raw.map(lambda r: build_example(r, tok), remove_columns=ds_raw.column_names)
+    import sqlite3
+    ctx = {}
+    with sqlite3.connect("explanations.sqlite") as conn:
+        for zh, expl in conn.execute(
+                "SELECT zh, explanation FROM poetry"):
+            ctx[zh] = expl
+
+    ds_proc = ds_raw.map(lambda r: build_example(r, tok, ctx), remove_columns=ds_raw.column_names)
     train_ds, val_ds = ds_proc.train_test_split(test_size=VAL_FRAC, seed=SEED).values()
     print("Train/test split:", len(train_ds), "/", len(val_ds))
 

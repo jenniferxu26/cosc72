@@ -1,117 +1,146 @@
 """
 # Baseline (no adapters)
-python 5_generate.py --test data/proc/test.jsonl \
-                    --out  infer/baseline_pred.jsonl
+python 5_generate.py --test data/proc/test.jsonl --out infer/baseline_pred.jsonl
 
 # Stacked adapters (accuracy + style)
-python 5_generate.py \
-        --acc_ckpt   checkpoints/mistral_lora/final_adapter \
-        --style_ckpt checkpoints/mistral_style/final_adapter_style \
-        --out        infer/stacked_pred.jsonl
+python 5_generate.py --acc_ckpt   checkpoints/mistral_lora/final_adapter --style_ckpt checkpoints/mistral_style/final_adapter_style --out infer/stacked_pred.jsonl
 """
-
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-import argparse, json, pathlib, torch
+import argparse, json, pathlib, re  # <-- CHANGED: added re
 from pathlib import Path
 from tqdm.auto import tqdm
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    BitsAndBytesConfig,
+    StoppingCriteria,
+    StoppingCriteriaList,
+)
 from peft import PeftModel
+import torch
 
-# paths & defaults
+# constants & defaults
 BASE_MODEL = "mistralai/Mistral-7B-Instruct-v0.3"
-TEST_DEF   = Path("data/proc/test.jsonl")
+TEST_DEF   = Path("data/proc/test_gloss.jsonl")
 OUT_DEF    = Path("infer/test_pred.jsonl")
 TEMP_DEF   = 0.8
 TOPP_DEF   = 0.9
 BATCH_DEF  = 4
 
 # CLI
-ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-ap.add_argument("--acc_ckpt",  type=Path, default=None, help="Path to accuracy LoRA adapter (translation). If omitted, run baseline model.")
-ap.add_argument("--style_ckpt",type=Path, default=None, help="Path to optional style LoRA adapter (diction). Stacked on top of --acc_ckpt.")
-ap.add_argument("--test",      type=Path, default=TEST_DEF, help="JSONL test file")
-ap.add_argument("--out",       type=Path, default=OUT_DEF,  help="Output JSONL file")
-ap.add_argument("--temp",      type=float, default=TEMP_DEF)
-ap.add_argument("--p",         type=float, default=TOPP_DEF)
-ap.add_argument("--batch",     type=int,   default=BATCH_DEF)
+ap = argparse.ArgumentParser(
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    description="Generate translations with (optionally) stacked LoRA adapters.",
+)
+ap.add_argument("--acc_ckpt",   type=Path, default=None,
+                help="Path to lexical‑accuracy LoRA adapter (optional)")
+ap.add_argument("--style_ckpt", type=Path, default=None,
+                help="Path to writing‑style LoRA adapter (optional)")
+ap.add_argument("--test", type=Path, default=TEST_DEF, help="Test jsonl file")
+ap.add_argument("--out",  type=Path, default=OUT_DEF,  help="Output jsonl file")
+ap.add_argument("--temp", type=float, default=TEMP_DEF, help="Sampling temperature")
+ap.add_argument("--p",    type=float, default=TOPP_DEF, help="top‑p nucleus sampling")
+ap.add_argument("--batch",type=int,   default=BATCH_DEF, help="Batch size (# prompts)")
+
 args = ap.parse_args()
 
-# load tokenizer
-tok_source = args.acc_ckpt if args.acc_ckpt else BASE_MODEL
-tok = AutoTokenizer.from_pretrained(tok_source, use_fast=True)
-if tok.pad_token is None:                 # ensure padding token exists
-    tok.pad_token = tok.eos_token
-    tok.pad_token_id = tok.eos_token_id
-
-# load model (+ adapters)
-bnb = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_compute_dtype=torch.bfloat16,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_use_double_quant=True,
-)
-
+# model & tokenizer
+print("Loading base model…")
+quant_cfg = BitsAndBytesConfig(llm_int8_threshold=6.0)
 model = AutoModelForCausalLM.from_pretrained(
-    BASE_MODEL, quantization_config=bnb, device_map="auto"
+    BASE_MODEL,
+    device_map="auto",
+    quantization_config=quant_cfg,
 )
 
-adapters = []
+tok = AutoTokenizer.from_pretrained(BASE_MODEL)
+if tok.pad_token is None:
+    tok.pad_token = tok.eos_token
+    model.config.pad_token_id = tok.eos_token_id
 
-# accuracy adapter
+# load one LoRA and optionally merge
+def load_and_merge(adapter_path: Path):
+    if adapter_path is None:  # no adapter
+        return
+    print(f"→  merging adapter {adapter_path}")
+    model_peft = PeftModel.from_pretrained(model, adapter_path, device_map="auto")
+    model_peft = model_peft.merge_and_unload()
+    return model_peft
+
+# merge adapters (accuracy + style)
 if args.acc_ckpt:
-    model = PeftModel.from_pretrained(model, str(args.acc_ckpt), device_map="auto")
-    adapters.append(str(args.acc_ckpt))
-    model = model.merge_and_unload()
-
-# style adapter (merged on top of accuracy)
+    model = load_and_merge(args.acc_ckpt)  # accuracy adapter
 if args.style_ckpt:
-    model = PeftModel.from_pretrained(
-        model, str(args.style_ckpt), adapter_name="style", device_map="auto"
-    )
-    adapters.append(str(args.style_ckpt))
-    model = model.merge_and_unload()
+    model = load_and_merge(args.style_ckpt)  # style adapter
 
 model.eval()
+print("Model ready. 8‑bit weights: ", any(p.dtype == torch.int8 for p in model.parameters()))
 
-print("Model ready | adapters:", adapters if adapters else "none (baseline)")
+# stop generation exactly at </trans>
+class StopOnTransEnd(StoppingCriteria):
+    def __init__(self, tokenizer):
+        self.end_ids = tokenizer.encode("</trans>")
 
-# load test data
+    def __call__(self, input_ids, scores, **kwargs):
+        return input_ids[0, -len(self.end_ids):].tolist() == self.end_ids
+
+stopper = StoppingCriteriaList([StopOnTransEnd(tok)])
+
+# data
+print("Loading test set →", args.test)
+
 test_ds = load_dataset("json", data_files=str(args.test), split="train")
-print("Test rows:", len(test_ds))
-
-# generate
 args.out.parent.mkdir(parents=True, exist_ok=True)
-with args.out.open("w", encoding="utf-8") as out_f:
 
-    batch_prompts, batch_meta = [], []
+out_f = args.out.open("w", encoding="utf-8")
 
-    def flush():
-        if not batch_prompts:
-            return
-        tokenized = tok(batch_prompts, return_tensors="pt", padding=True, truncation=True, max_length=512).to(model.device)
-        with torch.no_grad():
-            gen = model.generate(
-                **tokenized,
-                max_new_tokens=128,
-                do_sample=True,
-                temperature=args.temp,
-                top_p=args.p,
-                pad_token_id=tok.eos_token_id,
-            )
-        for meta, ids in zip(batch_meta, gen):
-            full = tok.decode(ids, skip_special_tokens=True)
-            meta["pred"] = full.split("<trans>")[-1].strip()
-            out_f.write(json.dumps(meta, ensure_ascii=False) + "\n")
-        batch_prompts.clear(); batch_meta.clear()
+# generation helpers
+BOS = "<cn>"
+EOS = "</cn>"
 
-    for rec in tqdm(test_ds, desc="generate"):
-        prompt = f"<cn>{rec['zh']}</cn>\n<gloss>{rec['gloss']}</gloss>\n<trans>"
-        batch_prompts.append(prompt)
-        batch_meta.append(rec)
-        if len(batch_prompts) >= args.batch:
-            flush()
-    flush()
+batch_prompts, batch_meta = [], []
+
+def flush():
+    if not batch_prompts:
+        return
+    tokenized = tok(batch_prompts, return_tensors="pt",
+                    padding=True, truncation=True, max_length=512).to(model.device)
+    with torch.no_grad():
+        gen = model.generate(
+            **tokenized,
+            max_new_tokens=128,
+            do_sample=True,
+            temperature=args.temp,
+            top_p=args.p,
+            pad_token_id=tok.eos_token_id,
+            stopping_criteria=stopper,
+        )
+    for meta, ids in zip(batch_meta, gen):
+        full = tok.decode(ids, skip_special_tokens=True)
+
+        # clean up
+        # 1) take text after first <trans>
+        sek = full.split("<trans>", 1)[-1]
+        # 2) stop at first closing tag or new tag
+        pred = re.split(r"</trans>|<cn>|</", sek, 1)[0].strip()
+
+        meta["pred"] = pred
+        out_f.write(json.dumps(meta, ensure_ascii=False) + "\n")
+
+    batch_prompts.clear(); batch_meta.clear()
+
+for rec in tqdm(test_ds, desc="generate"):
+    prompt = f"<cn>{rec['zh']}</cn>\n" # Chinese source
+    if rec["gloss"]:
+        prompt += f"<gloss>{rec['gloss']}</gloss>\n"
+    prompt += "<trans>" # request translation
+
+    batch_prompts.append(prompt)
+    batch_meta.append(dict(rec))
+    if len(batch_prompts) >= args.batch:
+        flush()
+flush()
 
 print("Translations written to", args.out.resolve())
